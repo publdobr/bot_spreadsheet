@@ -1,146 +1,142 @@
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
-const { GoogleSpreadsheet } = require('google-spreadsheet');
-const { JWT } = require('google-auth-library');
+const sheetService = require('./googleSheet');
 
-// Проверка наличия обязательных переменных окружения
-const requiredEnv = ['TELEGRAM_BOT_TOKEN', 'GOOGLE_SHEET_ID', 'GOOGLE_SERVICE_ACCOUNT_EMAIL', 'GOOGLE_PRIVATE_KEY'];
-for (const varName of requiredEnv) {
-  if (!process.env[varName]) {
-    console.error(`Ошибка: Переменная окружения ${varName} не установлена.`);
-    process.exit(1);
-  }
+// Проверка наличия токена бота
+if (!process.env.TELEGRAM_BOT_TOKEN) {
+  console.error('Ошибка: Переменная окружения TELEGRAM_BOT_TOKEN не установлена.');
+  process.exit(1);
 }
 
-// Инициализация переменных из .env
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const SHEET_ID = process.env.GOOGLE_SHEET_ID;
-const SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY.replace(/\n/g, '\n');
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
-// Настройка аутентификации с Google Sheets
-const serviceAccountAuth = new JWT({
-  email: SERVICE_ACCOUNT_EMAIL,
-  key: PRIVATE_KEY,
-  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-});
+// --- Обработчики команд ---
 
-const doc = new GoogleSpreadsheet(SHEET_ID, serviceAccountAuth);
-
-// Инициализация бота
-const bot = new Telegraf(BOT_TOKEN);
-
-// Переменная для кеширования заголовков
-let headersCache = [];
-
-/**
- * Функция для доступа к таблице и загрузки заголовков
- * @returns {Promise<GoogleSpreadsheetWorksheet|null>}
- */
-async function getSheet() {
-  try {
-    await doc.loadInfo(); // Загружаем информацию о документе
-    const sheet = doc.sheetsByIndex[0]; // Получаем первый лист
-    await sheet.loadHeaderRow(); // Загружаем строку с заголовками
-    headersCache = sheet.headerValues; // Кешируем заголовки
-    return sheet;
-  } catch (error) {
-    console.error('Ошибка доступа к Google Sheet:', error);
-    return null;
-  }
-}
-
-// Обработчик команды /start
+// /start: Приветственное сообщение
 bot.start((ctx) => {
   ctx.reply(
     'Добро пожаловать! Я бот для работы с Google Таблицей.\n\n' +
-    'Используйте команду /columns, чтобы увидеть список доступных столбцов.\n\n' +
-    'После этого отправьте мне название столбца, и я выведу все его уникальные значения.'
+    'Используйте команду /columns, чтобы выбрать столбец и получить данные.'
   );
 });
 
-// Обработчик команды /columns
+// /columns: Показывает кнопки с названиями столбцов
 bot.command('columns', async (ctx) => {
   try {
     await ctx.reply('Загружаю список столбцов...');
-    const sheet = await getSheet();
-    if (!sheet) {
-      return ctx.reply('Не удалось получить доступ к таблице. Проверьте настройки и права доступа.');
-    }
+    const headers = await sheetService.getHeaders();
 
-    const headers = headersCache;
     if (headers && headers.length > 0) {
-      const headerList = headers.map((header, index) => `${index + 1}. ${header}`).join('\n');
-      ctx.reply(`Вот список столбцов:\n\n${headerList}\n\nТеперь отправьте мне название нужного столбца.`);
+      const buttons = headers.map(header => Markup.button.callback(header, `column_${header}`));
+      const keyboard = Markup.inlineKeyboard(buttons, { columns: 2 });
+      ctx.reply('Выберите столбец для просмотра:', keyboard);
     } else {
       ctx.reply('В таблице не найдены столбцы или она пуста.');
     }
   } catch (error) {
     console.error('Ошибка в команде /columns:', error);
-    ctx.reply('Произошла ошибка при получении названий столбцов.');
+    ctx.reply('Произошла ошибка при получении названий столбцов. Проверьте настройки доступа к таблице.');
   }
 });
 
-// Обработчик текстовых сообщений
-bot.on('text', async (ctx) => {
-  const columnName = ctx.message.text.trim();
+// --- Обработчики действий (нажатий на кнопки) ---
 
-  // Игнорируем команды
-  if (columnName.startsWith('/')) {
-    return;
-  }
+// Действие для выбора столбца
+bot.action(/^column_(.+)/, async (ctx) => {
+  const columnName = ctx.match[1];
 
   try {
-    await ctx.reply(`Ищу уникальные значения в столбце "${columnName}"...`);
-    
-    const sheet = await getSheet();
-    if (!sheet) {
-      return ctx.reply('Не удалось получить доступ к таблице. Проверьте настройки.');
-    }
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(`Загружаю значения для столбца "${columnName}"...`);
 
-    // Проверяем, существует ли такой столбец
-    if (!headersCache.includes(columnName)) {
-      return ctx.reply(`Столбец с названием "${columnName}" не найден. Используйте /columns, чтобы увидеть правильные названия.`);
-    }
-
-    const rows = await sheet.getRows();
-    const values = new Set();
-
-    rows.forEach(row => {
-      const cellValue = row.get(columnName);
-      // Добавляем в Set только непустые значения
-      if (cellValue !== null && cellValue !== undefined && cellValue.toString().trim() !== '') {
-        values.add(cellValue.toString().trim());
-      }
-    });
-
-    const uniqueValues = Array.from(values);
+    const uniqueValues = await sheetService.getUniqueColumnValues(columnName);
 
     if (uniqueValues.length > 0) {
-      const resultMessage = `Уникальные значения для столбца "${columnName}":\n\n- ${uniqueValues.join('\n- ')}`;
-       // Проверяем длину сообщения, чтобы избежать ошибки Telegram API
-      if (resultMessage.length > 4096) {
-        ctx.reply(`Найдено слишком много уникальных значений (${uniqueValues.length}). Telegram не может отправить такое длинное сообщение.`);
+      const valueButtons = uniqueValues.map(value => {
+        const shortValue = value.length > 30 ? `${value.substring(0, 27)}...` : value;
+        const callbackData = `value_${columnName}_${encodeURIComponent(value)}`;
+
+        if (Buffer.byteLength(callbackData, 'utf8') > 64) {
+          console.warn(`Callback data for value "${value}" is too long. Skipping button.`);
+          return null;
+        }
+        return Markup.button.callback(shortValue, callbackData);
+      }).filter(Boolean);
+
+      if (valueButtons.length > 0) {
+        const keyboard = Markup.inlineKeyboard(valueButtons, { columns: 2 });
+        await ctx.editMessageText(`Выберите значение из столбца "${columnName}":`, keyboard);
       } else {
-        ctx.reply(resultMessage);
+        await ctx.editMessageText('Не удалось создать кнопки. Возможно, текст значений слишком длинный.');
       }
     } else {
-      ctx.reply(`В столбце "${columnName}" не найдено заполненных ячеек.`);
+      await ctx.editMessageText(`В столбце "${columnName}" не найдено заполненных ячеек.`);
     }
-
   } catch (error) {
-    console.error('Ошибка при обработке текстового сообщения:', error);
+    console.error(`Ошибка при обработке столбца ${columnName}:`, error);
     ctx.reply('Произошла внутренняя ошибка. Попробуйте позже.');
   }
 });
 
-// Запуск бота
+// Действие для выбора конкретного значения
+bot.action(/^value_(.+)_(.+)/, async (ctx) => {
+  const columnName = ctx.match[1];
+  const value = decodeURIComponent(ctx.match[2]);
+
+  try {
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(`Ищу информацию по запросу: "${value}"...`);
+
+    const rowData = await sheetService.findRowByValue(columnName, value);
+
+    if (rowData) {
+      let resultMessage = `*Найдена информация для "${value}":*\n\n`;
+      for (const [header, cellValue] of Object.entries(rowData)) {
+        resultMessage += `*${header}:* ${cellValue}\n`;
+      }
+
+      const keyboard = Markup.inlineKeyboard([
+        Markup.button.callback('‹ Назад к выбору столбца', 'back_to_columns')
+      ]);
+      await ctx.editMessageText(resultMessage, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+    } else {
+      await ctx.editMessageText(`Не удалось найти информацию для "${value}".`);
+    }
+  } catch (error) {
+    console.error(`Ошибка при поиске значения ${value}:`, error);
+    ctx.reply('Произошла внутренняя ошибка при поиске данных.');
+  }
+});
+
+// Действие для кнопки "Назад"
+bot.action('back_to_columns', async (ctx) => {
+  try {
+    await ctx.answerCbQuery();
+    await ctx.deleteMessage();
+    // Повторно вызываем команду /columns
+    ctx.command = 'columns';
+    await bot.handleUpdate(ctx.update);
+  } catch (error) {
+    console.error('Ошибка при возврате к выбору столбцов:', error);
+    ctx.reply('Не удалось вернуться к списку столбцов.');
+  }
+});
+
+// --- Обработка прочих сообщений ---
+
+bot.on('text', (ctx) => {
+  if (!ctx.message.text.startsWith('/')) {
+    ctx.reply('Пожалуйста, используйте команду /columns для начала работы.');
+  }
+});
+
+// --- Запуск и остановка бота ---
+
 bot.launch().then(() => {
   console.log('Бот успешно запущен');
 }).catch(err => {
   console.error('Ошибка при запуске бота:', err);
 });
 
-// Обработка graceful stop
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
